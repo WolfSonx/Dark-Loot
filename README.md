@@ -23,9 +23,6 @@ You can also paste a different export root into the `Export root` box and press 
 - Hide raw `Spawner` fallback sources so results focus on real monsters, props, and loot sources.
 - Double-click a source to choose map and difficulty before opening its drops.
 - Search items across all sources, maps, and difficulties.
-- Group identical item chances together to keep item search readable.
-- Sort result tables by clicking column headers.
-- Change luck with `Apply Luck` without rescanning the game files. The browser now refreshes only the active/focused view.
 - Save the scanned data with `Save Scan Cache`, then reopen the app later without rescanning.
 - Export current item results or source drops to CSV.
 
