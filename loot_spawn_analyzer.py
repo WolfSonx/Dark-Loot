@@ -13,9 +13,16 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from tkinter import filedialog, messagebox
-import tkinter as tk
-from tkinter import ttk
+
+try:
+    from tkinter import filedialog, messagebox
+    import tkinter as tk
+    from tkinter import ttk
+except Exception:
+    filedialog = None
+    messagebox = None
+    tk = None
+    ttk = None
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -1219,7 +1226,15 @@ def export_rows_to_csv(path: Path, rows: list[dict], luck: int) -> None:
             writer.writerow(output)
 
 
-class LootAnalyzerApp((TkinterDnD.Tk if TkinterDnD else tk.Tk)):
+if tk is not None:
+    TkBase = TkinterDnD.Tk if TkinterDnD else tk.Tk
+else:
+    class TkBase:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("Tkinter is not available in this Python build.")
+
+
+class LootAnalyzerApp(TkBase):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
@@ -2172,7 +2187,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         app = LootAnalyzerApp()
         app.mainloop()
-    except tk.TclError as exc:
+    except (RuntimeError, getattr(tk, "TclError", RuntimeError)) as exc:
         print("Could not start the Tkinter GUI.")
         print("Install/use a Python build with Tkinter enabled, or run with --scan-only for console validation.")
         print(exc)

@@ -8,6 +8,7 @@ import json
 import math
 import pickle
 import re
+import sys
 import threading
 import time
 import traceback
@@ -32,11 +33,25 @@ from loot_spawn_analyzer import (
 
 
 WEB_APP_TITLE = "DungeonCrawler Loot Browser"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CACHE_VERSION = 1
+INDEX_VERSION = 2
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 5000
-DEFAULT_CACHE_FILE = Path(__file__).with_name("loot_spawn_cache.pkl.gz")
+
+
+def app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundled_resource_path(name: str) -> Path:
+    return Path(getattr(sys, "_MEIPASS", app_base_dir())) / name
+
+
+DEFAULT_CACHE_FILE = app_base_dir() / "loot_spawn_cache.pkl.gz"
+DEFAULT_SETTINGS_FILE = app_base_dir() / "loot_spawn_settings.json"
 HIDDEN_MAPS = {"Global/Default"}
 HIDDEN_DIFFS = {"Global"}
 HIDDEN_SOURCE_KINDS = {"Spawner"}
@@ -188,7 +203,7 @@ def rows_with_luck(rows: list[dict], result: ScanResult | None, luck: int) -> li
 
 
 def compact_row(row: dict) -> dict:
-    return {
+    compact = {
         "item": row["item"],
         "itemAsset": row["item_asset"],
         "rarity": row["rarity"],
@@ -224,6 +239,13 @@ def compact_row(row: dict) -> dict:
         "rateTable": row["rate_table"],
         "spawner": row["spawner"],
     }
+    if "compare_dyn_at_least_one" in row:
+        compare_value = float(row.get("compare_dyn_at_least_one", 0.0) or 0.0)
+        current_value = float(row.get("dyn_at_least_one", 0.0) or 0.0)
+        compact["compareAtLeastOne"] = percent(compare_value)
+        compact["compareDelta"] = percent(compare_value - current_value)
+        compact["compareDeltaValue"] = compare_value - current_value
+    return compact
 
 
 def csv_rows(rows: list[dict]) -> bytes:
@@ -338,14 +360,25 @@ class WebIndex:
         return (item_candidates if len(item_candidates) <= len(source_candidates) else source_candidates), item_assets, source_keys
 
 
+class CacheUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if module == "__main__" and name == "WebIndex":
+            return WebIndex
+        return super().find_class(module, name)
+
+
 class AppState:
-    def __init__(self, root: Path, luck: int, cache_path: Path = DEFAULT_CACHE_FILE) -> None:
+    def __init__(self, root: Path, luck: int, cache_path: Path = DEFAULT_CACHE_FILE, settings_path: Path = DEFAULT_SETTINGS_FILE) -> None:
         self.lock = threading.RLock()
         self.root = Path(root)
         self.cache_path = Path(cache_path)
+        self.settings_path = Path(settings_path)
         self.luck = luck
         self.result = None
         self.index: WebIndex | None = None
+        self.cache_created_at = 0.0
+        self.data_loaded_at = 0.0
+        self.settings = self.load_settings()
         self.scanning = False
         self.recalculating = False
         self.saving_cache = False
@@ -387,6 +420,7 @@ class AppState:
             if not error:
                 self.result = result
                 self.index = index
+                self.data_loaded_at = time.time()
             self.error = error
             self.scanning = False
             self.finished_at = time.time()
@@ -404,16 +438,23 @@ class AppState:
     def load_cache(self, path: Path | None = None) -> bool:
         cache_path = Path(path or self.cache_path)
         if not cache_path.exists():
+            bundled_cache = bundled_resource_path(cache_path.name)
+            if bundled_cache.exists():
+                cache_path = bundled_cache
+        if not cache_path.exists():
             return False
         try:
             with gzip.open(cache_path, "rb") as handle:
-                payload = pickle.load(handle)
+                payload = CacheUnpickler(handle).load()
             if payload.get("cache_version") != CACHE_VERSION:
                 raise ValueError(f"Unsupported cache version: {payload.get('cache_version')}")
             result = payload["result"]
-            index = WebIndex(result.rows)
+            index = payload.get("index") if payload.get("index_version") == INDEX_VERSION else None
+            if index is None:
+                index = WebIndex(result.rows)
             root = Path(payload.get("root") or self.root)
             luck = int(payload.get("luck", scan_luck(result)) or scan_luck(result))
+            created_at = float(payload.get("created_at", 0.0) or 0.0)
         except Exception:
             with self.lock:
                 self.cache_error = traceback.format_exc()
@@ -423,6 +464,8 @@ class AppState:
             self.luck = luck
             self.result = result
             self.index = index
+            self.cache_created_at = created_at
+            self.data_loaded_at = time.time()
             self.error = ""
             self.cache_error = ""
             self.finished_at = time.time()
@@ -439,22 +482,26 @@ class AppState:
             self.cache_started_at = time.time()
             self.cache_finished_at = 0.0
             result = self.result
+            index = self.index
             root = self.root
             luck = self.luck
             cache_path = self.cache_path
-        thread = threading.Thread(target=self._cache_worker, args=(result, root, luck, cache_path), daemon=True)
+        thread = threading.Thread(target=self._cache_worker, args=(result, index, root, luck, cache_path), daemon=True)
         thread.start()
         return True
 
-    def _cache_worker(self, result: ScanResult, root: Path, luck: int, cache_path: Path) -> None:
+    def _cache_worker(self, result: ScanResult, index: WebIndex | None, root: Path, luck: int, cache_path: Path) -> None:
         try:
+            created_at = time.time()
             payload = {
                 "cache_version": CACHE_VERSION,
+                "index_version": INDEX_VERSION,
                 "app_version": APP_VERSION,
-                "created_at": time.time(),
+                "created_at": created_at,
                 "root": str(root),
                 "luck": int(luck),
                 "result": result,
+                "index": index,
             }
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
@@ -463,11 +510,40 @@ class AppState:
             temp_path.replace(cache_path)
             error = ""
         except Exception:
+            created_at = 0.0
             error = traceback.format_exc()
         with self.lock:
             self.cache_error = error
             self.saving_cache = False
             self.cache_finished_at = time.time()
+            if not error:
+                self.cache_created_at = created_at
+
+    def load_settings(self) -> dict:
+        if not self.settings_path.exists():
+            return {}
+        try:
+            with self.settings_path.open("r", encoding="utf-8") as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def save_settings(self, value: dict) -> bool:
+        try:
+            cleaned = value if isinstance(value, dict) else {}
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.settings_path.with_suffix(self.settings_path.suffix + ".tmp")
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(cleaned, handle, indent=2, ensure_ascii=False)
+            temp_path.replace(self.settings_path)
+        except Exception:
+            with self.lock:
+                self.cache_error = traceback.format_exc()
+            return False
+        with self.lock:
+            self.settings = cleaned
+        return True
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -492,7 +568,11 @@ class AppState:
             last_recalc = (self.recalc_finished_at - self.recalc_started_at) if self.recalc_finished_at and self.recalc_started_at else 0.0
             cache_elapsed = (time.time() - self.cache_started_at) if self.saving_cache and self.cache_started_at else 0.0
             last_cache = (self.cache_finished_at - self.cache_started_at) if self.cache_finished_at and self.cache_started_at else 0.0
-            cache_size = self.cache_path.stat().st_size if self.cache_path.exists() else 0
+            bundled_cache_path = bundled_resource_path(self.cache_path.name)
+            readable_cache_path = self.cache_path if self.cache_path.exists() else bundled_cache_path
+            cache_exists = readable_cache_path.exists()
+            cache_size = readable_cache_path.stat().st_size if cache_exists else 0
+            generated_root = stats.get("generated_root", "")
             return {
                 "title": WEB_APP_TITLE,
                 "scannerTitle": SCANNER_TITLE,
@@ -506,18 +586,29 @@ class AppState:
                 "stats": stats,
                 "filters": filters,
                 "warnings": warnings,
+                "settings": self.settings,
+                "data": {
+                    "generatedRoot": generated_root,
+                    "loadedAt": self.data_loaded_at or self.finished_at,
+                    "cacheCreatedAt": self.cache_created_at,
+                    "cacheVersion": CACHE_VERSION,
+                    "indexVersion": INDEX_VERSION,
+                    "settingsPath": str(self.settings_path),
+                },
                 "elapsed": elapsed,
                 "lastScanSeconds": last_scan,
                 "recalcElapsed": recalc_elapsed,
                 "lastRecalcSeconds": last_recalc,
                 "cache": {
-                    "path": str(self.cache_path),
-                    "exists": self.cache_path.exists(),
+                    "path": str(readable_cache_path if cache_exists else self.cache_path),
+                    "savePath": str(self.cache_path),
+                    "exists": cache_exists,
                     "saving": self.saving_cache,
                     "error": self.cache_error,
                     "elapsed": cache_elapsed,
                     "lastSaveSeconds": last_cache,
                     "sizeBytes": cache_size,
+                    "createdAt": self.cache_created_at,
                 },
             }
 
@@ -763,6 +854,32 @@ def is_default_item_query(params: dict[str, list[str]]) -> bool:
     )
 
 
+def filter_item_summary_rows(index: WebIndex, params: dict[str, list[str]]) -> list[dict] | None:
+    if param(params, "source"):
+        return None
+
+    terms = clean_terms(param(params, "search"))
+    selected_map = param(params, "map", "All")
+    selected_diff = param(params, "diff", "All")
+    category = param(params, "category", "All")
+    rarity = param(params, "rarity", "All")
+
+    rows = []
+    for row in index.item_summaries:
+        if terms and not terms_match_text(terms, f"{row['item']} {row['item_asset']}".lower()):
+            continue
+        if selected_map != "All" and selected_map not in row["maps"]:
+            continue
+        if selected_diff != "All" and selected_diff not in row["diffs"]:
+            continue
+        if category != "All" and row["cat"] != category:
+            continue
+        if rarity != "All" and row["rarity"] != rarity:
+            continue
+        rows.append(row)
+    return rows
+
+
 def source_summaries_for(index: WebIndex, result: ScanResult | None, luck: int, params: dict[str, list[str]]) -> list[dict]:
     source = param(params, "source")
     item = param(params, "item")
@@ -804,6 +921,150 @@ def filter_exact_source_rows(index: WebIndex, params: dict[str, list[str]]) -> l
             continue
         filtered.append(row)
     return filtered
+
+
+def filter_item_source_rows(index: WebIndex, params: dict[str, list[str]]) -> list[dict]:
+    item_asset = unquote(param(params, "asset"))
+    item_query = param(params, "item")
+    source_query = param(params, "source")
+    selected_map = param(params, "map", "All")
+    selected_diff = param(params, "diff", "All")
+    rarity = param(params, "rarity", "All")
+    category = param(params, "category", "All")
+    source_keys = index.matching_source_keys(source_query)
+    item_assets = None
+    if item_asset:
+        candidates = list(index.item_rows.get(item_asset, ()))
+    else:
+        candidates, item_assets, _ = index.candidate_rows(item_query, source_query)
+
+    item_terms = clean_terms(item_query)
+    filtered = []
+    for row in candidates:
+        if item_asset and row["item_asset"] != item_asset:
+            continue
+        if item_assets is not None and row["item_asset"] not in item_assets:
+            continue
+        if item_terms and not terms_match_text(item_terms, f"{row['item']} {row['item_asset']}".lower()):
+            continue
+        if source_keys is not None and (row["source"], row["source_kind"]) not in source_keys:
+            continue
+        if selected_map != "All" and selected_map not in row["maps"]:
+            continue
+        if selected_diff != "All" and selected_diff not in row["diffs"]:
+            continue
+        if rarity != "All" and row["rarity"] != rarity:
+            continue
+        if category != "All" and row["cat"] != category:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def source_pair_summary(rows: list[dict]) -> list[dict]:
+    pairs = {
+        (map_name, diff)
+        for row in rows
+        for map_name in row["maps"]
+        for diff in row["diffs"]
+        if map_name not in HIDDEN_MAPS and diff not in HIDDEN_DIFFS
+    }
+    return [
+        {"map": map_name, "diff": diff}
+        for map_name, diff in sorted(pairs, key=lambda item: (map_sort_key(item[0]), difficulty_sort_key(item[1])))
+    ]
+
+
+def item_source_summary(rows: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row["source"], row["source_kind"])
+        summary = grouped.get(key)
+        if not summary:
+            summary = {
+                "source": row["source"],
+                "sourceKind": row["source_kind"],
+                "maps": set(),
+                "diffs": set(),
+                "scenarios": set(),
+                "best": row,
+                "rows": 0,
+            }
+            grouped[key] = summary
+        summary["maps"].update(row["maps"])
+        summary["diffs"].update(row["diffs"])
+        summary["scenarios"].add(scenario_key(row))
+        summary["rows"] += int(row.get("merged_rows", 1) or 1)
+        if row["dyn_at_least_one"] > summary["best"]["dyn_at_least_one"]:
+            summary["best"] = row
+
+    summaries = []
+    for item in grouped.values():
+        best = item["best"]
+        summaries.append(
+            {
+                "source": item["source"],
+                "sourceKind": item["sourceKind"],
+                "maps": summarize_maps(item["maps"]),
+                "mapValues": visible_map_values(item["maps"]),
+                "diffs": summarize_diffs(item["diffs"]),
+                "diffValues": visible_diff_values(item["diffs"]),
+                "scenarioCount": len(item["scenarios"]),
+                "rowCount": item["rows"],
+                "baseChance": percent(best["base_at_least_one"]),
+                "chance": percent(best["dyn_at_least_one"]),
+                "chanceValue": best["dyn_at_least_one"],
+            }
+        )
+    return sorted(summaries, key=lambda value: (-value["chanceValue"], value["source"].lower(), value["sourceKind"]))
+
+
+def sort_item_source_rows(rows: list[dict], sort_key: str, descending: bool) -> list[dict]:
+    allowed = {
+        "source": lambda row: row["source"].lower(),
+        "kind": lambda row: row["sourceKind"].lower(),
+        "maps": lambda row: row["maps"].lower(),
+        "diff": lambda row: row["diffs"].lower(),
+        "scenarios": lambda row: row["scenarioCount"],
+        "chance": lambda row: row["chanceValue"],
+    }
+    getter = allowed.get(sort_key, allowed["chance"])
+    return sorted(rows, key=getter, reverse=descending)
+
+
+def detail_compare_key(row: dict) -> tuple:
+    return (
+        row["item_asset"],
+        row["item"],
+        row["rarity"],
+        row["cat"],
+        row["grade"],
+        row["item_count"],
+        row["rolls"],
+        row["choice_count"],
+        row["grade_choices"],
+        row["empty_choices"],
+        row.get("loot_asset", row["loot_table"]),
+        row.get("rate_key", row["rate_table"]),
+        row["group"],
+        row["loot_table"],
+        row["rate_table"],
+    )
+
+
+def attach_compare_luck(rows: list[dict], base_rows: list[dict], result: ScanResult | None, compare_luck: int | None) -> list[dict]:
+    if not result or compare_luck is None:
+        return rows
+    compare_rows = detail_summary(rows_with_luck(base_rows, result, compare_luck))
+    compare_by_key = {detail_compare_key(row): row for row in compare_rows}
+    updated_rows = []
+    for row in rows:
+        updated = dict(row)
+        compare_row = compare_by_key.get(detail_compare_key(row))
+        if compare_row:
+            updated["compare_dyn_at_least_one"] = compare_row["dyn_at_least_one"]
+        updated_rows.append(updated)
+    return updated_rows
 
 
 def sort_rows(rows: list[dict], sort_key: str, descending: bool) -> list[dict]:
@@ -866,7 +1127,10 @@ def sort_detail_rows(rows: list[dict], sort_key: str, descending: bool) -> list[
 
 
 def item_results_for(index: WebIndex, result: ScanResult | None, luck: int, params: dict[str, list[str]]) -> list[dict]:
-    if luck == scan_luck(result) and is_default_item_query(params):
+    summary_rows = filter_item_summary_rows(index, params)
+    if summary_rows is not None:
+        rows = summary_rows
+    elif luck == scan_luck(result) and is_default_item_query(params):
         rows = index.item_summaries
     else:
         rows = item_summary(rows_with_luck(filter_item_rows(index, params), result, luck))
@@ -892,16 +1156,20 @@ INDEX_HTML = r"""<!doctype html>
   <title>DungeonCrawler Loot Browser</title>
   <style>
     :root {
-      --bg: #101312;
-      --panel: #1b201d;
-      --panel-2: #252c28;
-      --line: #344039;
-      --text: #f0eee7;
-      --muted: #a7b0a9;
-      --accent: #78d6b1;
-      --accent-2: #e0b85f;
-      --danger: #ee7c69;
-      --input: #111614;
+      --bg: #0f1216;
+      --panel: #181d23;
+      --panel-2: #222936;
+      --panel-3: #263241;
+      --line: #344252;
+      --line-soft: #27313c;
+      --text: #f3f6f8;
+      --muted: #a9b5c1;
+      --accent: #61d9bc;
+      --accent-2: #f0c76a;
+      --blue: #74a7ff;
+      --violet: #bd92ff;
+      --danger: #f27f74;
+      --input: #111720;
     }
     * { box-sizing: border-box; }
     body {
@@ -926,12 +1194,40 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 6px;
       padding: 0 12px;
       cursor: pointer;
+      transition: background .12s ease, border-color .12s ease, transform .12s ease;
     }
     button.primary {
-      background: #256654;
-      border-color: #347e69;
+      background: #21836d;
+      border-color: #38aa8f;
       color: #ffffff;
       font-weight: 600;
+    }
+    button:hover:not(:disabled) {
+      background: #2c3747;
+      border-color: #52647a;
+      transform: translateY(-1px);
+    }
+    button.primary:hover:not(:disabled) {
+      background: #27947b;
+      border-color: #57d4b5;
+    }
+    button.small {
+      min-height: 26px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+    button.favorite {
+      width: 30px;
+      min-width: 30px;
+      padding: 0;
+      color: var(--muted);
+      background: #151d27;
+    }
+    button.favorite.active {
+      color: #12110b;
+      background: var(--accent-2);
+      border-color: #ffe39a;
+      font-weight: 700;
     }
     button:disabled {
       opacity: .55;
@@ -949,11 +1245,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     input:focus, select:focus {
       border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(97, 217, 188, .16);
     }
     header {
       padding: 16px 20px 12px;
       border-bottom: 1px solid var(--line);
-      background: #171c19;
+      border-top: 3px solid var(--accent);
+      background: #151b22;
       box-shadow: 0 12px 40px rgba(0, 0, 0, .18);
       position: sticky;
       top: 0;
@@ -971,6 +1269,7 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 18px;
       font-weight: 650;
       letter-spacing: 0;
+      color: #ffffff;
     }
     .status {
       color: var(--accent);
@@ -980,7 +1279,7 @@ INDEX_HTML = r"""<!doctype html>
     .status.error { color: var(--danger); }
     .scan-grid {
       display: grid;
-      grid-template-columns: minmax(280px, 1fr) 90px auto auto auto;
+      grid-template-columns: minmax(280px, 1fr) 90px auto auto auto auto;
       gap: 8px;
       align-items: end;
     }
@@ -999,12 +1298,14 @@ INDEX_HTML = r"""<!doctype html>
     .tab {
       border-bottom-left-radius: 0;
       border-bottom-right-radius: 0;
-      background: #1d1f1e;
+      background: #18202a;
+      color: var(--muted);
     }
     .tab.active {
       color: #fff;
       border-color: var(--accent);
-      background: var(--panel);
+      background: #213144;
+      box-shadow: inset 0 3px 0 var(--accent);
     }
     main {
       padding: 14px 20px 18px;
@@ -1023,6 +1324,18 @@ INDEX_HTML = r"""<!doctype html>
       margin: 0;
       font-size: 15px;
       font-weight: 650;
+      color: #ffffff;
+    }
+    .section-head h2::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 8px;
+      border-radius: 50%;
+      background: var(--accent-2);
+      box-shadow: 0 0 0 4px rgba(240, 199, 106, .13);
+      vertical-align: 1px;
     }
     section {
       display: none;
@@ -1036,12 +1349,13 @@ INDEX_HTML = r"""<!doctype html>
     }
     .stat {
       border: 1px solid var(--line);
-      background: var(--panel);
+      background: #161d25;
       border-radius: 8px;
       padding: 6px 8px;
       min-height: 46px;
       color: var(--muted);
       font-size: 12px;
+      box-shadow: inset 3px 0 0 rgba(97, 217, 188, .45);
     }
     .stat b {
       display: block;
@@ -1066,6 +1380,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow-y: auto;
       background: var(--panel);
       max-height: calc(100vh - 285px);
+      box-shadow: 0 16px 45px rgba(0, 0, 0, .20);
     }
     table {
       border-collapse: collapse;
@@ -1074,19 +1389,19 @@ INDEX_HTML = r"""<!doctype html>
       min-width: 1450px;
     }
     .source-table {
+      width: max(100%, 1040px);
+      min-width: 1040px;
+    }
+    .item-table {
       width: max(100%, 980px);
       min-width: 980px;
     }
-    .item-table {
-      width: max(100%, 940px);
-      min-width: 940px;
-    }
     .detail .table-wrap table {
-      width: max(100%, 1420px);
-      min-width: 1420px;
+      width: max(100%, 1560px);
+      min-width: 1560px;
     }
     th, td {
-      border-bottom: 1px solid #333734;
+      border-bottom: 1px solid var(--line-soft);
       padding: 8px 9px;
       text-align: left;
       vertical-align: middle;
@@ -1097,7 +1412,7 @@ INDEX_HTML = r"""<!doctype html>
     th {
       position: sticky;
       top: 0;
-      background: #272a28;
+      background: #202a36;
       color: #f3f0e9;
       z-index: 1;
       font-size: 12px;
@@ -1110,7 +1425,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     th.sortable:hover {
       color: #ffffff;
-      background: #303531;
+      background: #293747;
     }
     th.sortable:focus {
       outline: 1px solid var(--accent);
@@ -1126,10 +1441,55 @@ INDEX_HTML = r"""<!doctype html>
     }
     th.sortable.sort-asc::after { content: "^"; }
     th.sortable.sort-desc::after { content: "v"; }
-    tr:hover td { background: #252a27; }
+    tbody tr:nth-child(even) td { background: rgba(255, 255, 255, .018); }
+    tr:hover td { background: #223041; }
     tr.clickable { cursor: pointer; }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
     .muted { color: var(--muted); }
+    .primary-name {
+      color: #ffffff;
+      font-weight: 600;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      max-width: 100%;
+      border-radius: 999px;
+      padding: 2px 8px;
+      border: 1px solid rgba(255, 255, 255, .14);
+      background: rgba(255, 255, 255, .06);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.2;
+      white-space: nowrap;
+    }
+    .pill + .pill { margin-left: 4px; }
+    .pill.summary {
+      color: var(--accent-2);
+      background: rgba(240, 199, 106, .12);
+      border-color: rgba(240, 199, 106, .35);
+    }
+    .rarity-junk { color: #c8c8c8; background: rgba(200, 200, 200, .09); }
+    .rarity-common { color: #f2f2f2; background: rgba(255, 255, 255, .08); }
+    .rarity-uncommon { color: #76df8f; background: rgba(118, 223, 143, .12); border-color: rgba(118, 223, 143, .35); }
+    .rarity-rare { color: #68a8ff; background: rgba(104, 168, 255, .13); border-color: rgba(104, 168, 255, .36); }
+    .rarity-epic { color: #bf8dff; background: rgba(191, 141, 255, .14); border-color: rgba(191, 141, 255, .38); }
+    .rarity-legendary { color: #f4b35f; background: rgba(244, 179, 95, .14); border-color: rgba(244, 179, 95, .42); }
+    .rarity-unique { color: #ffdf6b; background: rgba(255, 223, 107, .15); border-color: rgba(255, 223, 107, .48); }
+    .rarity-artifact { color: #ff8a8a; background: rgba(255, 138, 138, .15); border-color: rgba(255, 138, 138, .48); }
+    .kind-monster { color: #ffb58f; background: rgba(255, 181, 143, .12); border-color: rgba(255, 181, 143, .35); }
+    .kind-prop { color: #83d6ff; background: rgba(131, 214, 255, .12); border-color: rgba(131, 214, 255, .35); }
+    .kind-loot { color: #f0c76a; background: rgba(240, 199, 106, .12); border-color: rgba(240, 199, 106, .35); }
+    .diff-pve { color: #7ee6c4; background: rgba(126, 230, 196, .12); border-color: rgba(126, 230, 196, .35); }
+    .diff-normal { color: #d6e2ed; background: rgba(214, 226, 237, .08); }
+    .diff-high-roller { color: #d7a1ff; background: rgba(215, 161, 255, .13); border-color: rgba(215, 161, 255, .35); }
+    .diff-squire { color: #ffd36f; background: rgba(255, 211, 111, .13); border-color: rgba(255, 211, 111, .35); }
+    .category-equipment { color: #8fbfff; background: rgba(143, 191, 255, .12); border-color: rgba(143, 191, 255, .35); }
+    .category-treasure { color: #ffd36f; background: rgba(255, 211, 111, .13); border-color: rgba(255, 211, 111, .35); }
+    .category-consumable { color: #9ff0a9; background: rgba(159, 240, 169, .12); border-color: rgba(159, 240, 169, .35); }
+    .category-material-currency { color: #74ddff; background: rgba(116, 221, 255, .12); border-color: rgba(116, 221, 255, .35); }
+    .category-special-quest { color: #ff9fc7; background: rgba(255, 159, 199, .12); border-color: rgba(255, 159, 199, .35); }
     .toolbar {
       display: flex;
       justify-content: space-between;
@@ -1158,6 +1518,78 @@ INDEX_HTML = r"""<!doctype html>
       width: 86px;
       min-height: 30px;
     }
+    .preset-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .preset-strip button {
+      min-height: 26px;
+      font-size: 12px;
+      padding: 0 8px;
+      background: #182431;
+    }
+    .item-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 4px 0 12px;
+      color: var(--muted);
+    }
+    .modal.large {
+      width: min(900px, 100%);
+    }
+    .modal-table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: auto;
+      max-height: min(460px, 55vh);
+      background: var(--panel);
+      margin-top: 10px;
+    }
+    .modal-table {
+      width: max(100%, 760px);
+      min-width: 760px;
+    }
+    .favorites-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .favorite-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+    .favorite-panel h3 {
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      color: #fff;
+    }
+    .favorite-panel .table-wrap {
+      border: 0;
+      border-radius: 0;
+      max-height: 520px;
+      box-shadow: none;
+    }
+    .favorite-panel table {
+      width: max(100%, 560px);
+      min-width: 560px;
+    }
+    .data-label {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .compare-col.hidden {
+      display: none;
+    }
+    .delta-pos { color: #8cf0a6; }
+    .delta-neg { color: #ff9f9f; }
     .detail {
       margin-top: 14px;
       border: 1px solid var(--line);
@@ -1259,6 +1691,9 @@ INDEX_HTML = r"""<!doctype html>
       .scan-grid, .filters, .stats, .modal-grid {
         grid-template-columns: 1fr;
       }
+      .favorites-grid {
+        grid-template-columns: 1fr;
+      }
       .app-footer {
         grid-template-columns: 1fr;
       }
@@ -1277,7 +1712,10 @@ INDEX_HTML = r"""<!doctype html>
   <header>
     <div class="title-row">
       <h1>DungeonCrawler Loot Browser</h1>
-      <div id="status" class="status">Starting...</div>
+      <div>
+        <div id="status" class="status">Starting...</div>
+        <div id="dataLabel" class="data-label"></div>
+      </div>
     </div>
     <div class="scan-grid">
       <div>
@@ -1289,6 +1727,7 @@ INDEX_HTML = r"""<!doctype html>
         <input id="luckInput" type="number" min="0" max="500" value="500">
       </div>
       <button id="scanButton" class="primary">Scan</button>
+      <button id="scanSaveButton">Scan + Save Cache</button>
       <button id="luckButton">Apply Luck</button>
       <button id="refreshButton">Refresh</button>
     </div>
@@ -1297,6 +1736,7 @@ INDEX_HTML = r"""<!doctype html>
   <nav class="tabs">
     <button class="tab active" data-tab="sources">Mob/Chest Search</button>
     <button class="tab" data-tab="items">Item Search</button>
+    <button class="tab" data-tab="favorites">Favorites</button>
     <button class="tab" data-tab="scan">Scan Info</button>
   </nav>
 
@@ -1344,6 +1784,7 @@ INDEX_HTML = r"""<!doctype html>
         <table class="source-table">
           <thead>
             <tr>
+              <th title="Favorite">Fav</th>
               <th class="sortable" data-table="source" data-sort="source" title="Sort by source">Source</th>
               <th class="sortable" data-table="source" data-sort="kind" title="Sort by kind">Kind</th>
               <th class="num sortable" data-table="source" data-sort="items" title="Sort by item count">Items</th>
@@ -1380,6 +1821,10 @@ INDEX_HTML = r"""<!doctype html>
               <select id="detailRarity"></select>
             </div>
             <div>
+              <label>Compare luck</label>
+              <input id="detailCompareLuck" type="number" min="0" max="500" placeholder="Optional">
+            </div>
+            <div>
               <label>Rows</label>
               <select id="detailLimit"><option>250</option><option selected>500</option><option>1000</option><option>2500</option></select>
             </div>
@@ -1397,6 +1842,8 @@ INDEX_HTML = r"""<!doctype html>
                   <th class="num sortable" data-table="detail" data-sort="rolls" title="Sort by rolls">Rolls</th>
                   <th class="num sortable" data-table="detail" data-sort="base" title="Sort by base chance">Base Chance</th>
                   <th class="num sortable" data-table="detail" data-sort="dyn" title="Sort by chance with luck">Chance With Luck</th>
+                  <th id="compareHead" class="num compare-col hidden">Compare</th>
+                  <th id="compareDeltaHead" class="num compare-col hidden">Change</th>
                   <th class="sortable" data-table="detail" data-sort="loot" title="Sort by loot table">Loot Table</th>
                   <th class="sortable" data-table="detail" data-sort="rate" title="Sort by rate table">Rate Table</th>
                 </tr>
@@ -1454,6 +1901,7 @@ INDEX_HTML = r"""<!doctype html>
         <table class="item-table">
           <thead>
             <tr>
+              <th title="Favorite">Fav</th>
               <th class="sortable" data-table="item" data-sort="item" title="Sort by item">Item</th>
               <th class="sortable" data-table="item" data-sort="rarity" title="Sort by rarity">Rarity</th>
               <th class="sortable" data-table="item" data-sort="category" title="Sort by category">Category</th>
@@ -1464,6 +1912,47 @@ INDEX_HTML = r"""<!doctype html>
           </thead>
           <tbody id="itemRows"></tbody>
         </table>
+      </div>
+    </section>
+
+    <section id="favorites">
+      <div class="section-head">
+        <h2>Favorites</h2>
+        <button id="clearFavorites">Clear Favorites</button>
+      </div>
+      <div class="favorites-grid">
+        <div class="favorite-panel">
+          <h3>Sources</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Source</th>
+                  <th>Kind</th>
+                  <th>Open</th>
+                  <th>Remove</th>
+                </tr>
+              </thead>
+              <tbody id="favoriteSourceRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="favorite-panel">
+          <h3>Items</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Item</th>
+                  <th>Rarity</th>
+                  <th>Open</th>
+                  <th>Remove</th>
+                </tr>
+              </thead>
+              <tbody id="favoriteItemRows"></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -1501,9 +1990,62 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <div id="modalCount" class="muted" style="margin-top: 10px"></div>
+      <div id="modalPresets" class="preset-strip"></div>
       <div class="modal-actions">
         <button id="modalCancel">Cancel</button>
         <button id="modalOpen" class="primary">Open Drops</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="itemModal" class="modal-backdrop">
+    <div class="modal large">
+      <h2 id="itemModalTitle">Item Details</h2>
+      <div id="itemModalSummary" class="item-summary"></div>
+      <div class="modal-grid">
+        <div>
+          <label>Source search</label>
+          <input id="itemModalSource" placeholder="Monster or chest name">
+        </div>
+        <div>
+          <label>Map</label>
+          <select id="itemModalMap"></select>
+        </div>
+        <div>
+          <label>Difficulty</label>
+          <select id="itemModalDiff"></select>
+        </div>
+        <div>
+          <label>Rows</label>
+          <select id="itemModalLimit"><option>50</option><option selected>100</option><option>250</option><option>500</option></select>
+        </div>
+      </div>
+      <div class="toolbar">
+        <span id="itemModalCount">0 sources</span>
+        <div class="toolbar-actions">
+          <button id="itemModalPrev">Prev</button>
+          <button id="itemModalNext">Next</button>
+        </div>
+      </div>
+      <div class="modal-table-wrap">
+        <table class="modal-table">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Kind</th>
+              <th>Maps</th>
+              <th>Difficulties</th>
+              <th class="num">Scenarios</th>
+              <th class="num">Chance</th>
+              <th>Open</th>
+            </tr>
+          </thead>
+          <tbody id="itemModalRows"></tbody>
+        </table>
+      </div>
+      <div class="modal-actions">
+        <button id="itemModalFavorite">Favorite Item</button>
+        <button id="itemModalClose">Close</button>
       </div>
     </div>
   </div>
@@ -1521,10 +2063,17 @@ INDEX_HTML = r"""<!doctype html>
       sourceSort: { key: "source", dir: "asc" },
       itemSort: { key: "item", dir: "asc" },
       detailSort: { key: "dyn", dir: "desc" },
+      itemSourceSort: { key: "chance", dir: "desc" },
       sourceRequest: 0,
       itemRequest: 0,
       detailRequest: 0,
+      itemSourceRequest: 0,
+      itemSourceOffset: 0,
+      selectedItem: null,
       lastStatus: null,
+      settings: { favorites: { sources: [], items: [] }, ui: {} },
+      settingsLoaded: false,
+      uiRestored: false,
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1549,6 +2098,101 @@ INDEX_HTML = r"""<!doctype html>
     function setStatus(text, isError = false) {
       $("status").textContent = text;
       $("status").classList.toggle("error", isError);
+    }
+
+    function normalizeSettings(value) {
+      const settings = value && typeof value === "object" ? value : {};
+      settings.favorites = settings.favorites && typeof settings.favorites === "object" ? settings.favorites : {};
+      settings.favorites.sources = Array.isArray(settings.favorites.sources) ? settings.favorites.sources : [];
+      settings.favorites.items = Array.isArray(settings.favorites.items) ? settings.favorites.items : [];
+      settings.ui = settings.ui && typeof settings.ui === "object" ? settings.ui : {};
+      return settings;
+    }
+
+    const saveSettings = debounce(async () => {
+      try {
+        await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state.settings),
+        });
+      } catch (error) {
+        setStatus(`Settings save failed: ${error.message}`, true);
+      }
+    }, 500);
+
+    function favoriteSourceKey(source, kind) {
+      return `${source}\u0001${kind}`;
+    }
+
+    function favoriteItemKey(item) {
+      return item.itemAsset || `${item.item}\u0001${item.rarity || ""}`;
+    }
+
+    function isFavoriteSource(source, kind) {
+      const key = favoriteSourceKey(source, kind);
+      return state.settings.favorites.sources.some((item) => favoriteSourceKey(item.source, item.kind) === key);
+    }
+
+    function isFavoriteItem(item) {
+      const key = favoriteItemKey(item);
+      return state.settings.favorites.items.some((fav) => favoriteItemKey(fav) === key);
+    }
+
+    function toggleFavoriteSource(source, kind) {
+      const key = favoriteSourceKey(source, kind);
+      const current = state.settings.favorites.sources;
+      const index = current.findIndex((item) => favoriteSourceKey(item.source, item.kind) === key);
+      if (index >= 0) {
+        current.splice(index, 1);
+      } else {
+        current.push({ source, kind });
+      }
+      renderFavorites();
+      refreshFavoriteButtons();
+      saveSettings();
+    }
+
+    function toggleFavoriteItem(item) {
+      const key = favoriteItemKey(item);
+      const current = state.settings.favorites.items;
+      const index = current.findIndex((fav) => favoriteItemKey(fav) === key);
+      if (index >= 0) {
+        current.splice(index, 1);
+      } else {
+        current.push({
+          item: item.item,
+          itemAsset: item.itemAsset,
+          rarity: item.rarity,
+          category: item.category,
+        });
+      }
+      renderFavorites();
+      refreshFavoriteButtons();
+      saveSettings();
+    }
+
+    function refreshFavoriteButtons() {
+      document.querySelectorAll("button.favorite[data-fav-type='source']").forEach((button) => {
+        const active = isFavoriteSource(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind));
+        button.classList.toggle("active", active);
+        button.textContent = active ? "*" : "+";
+        button.title = active ? "Remove favorite" : "Add favorite";
+      });
+      document.querySelectorAll("button.favorite[data-fav-type='item']").forEach((button) => {
+        const active = isFavoriteItem({ itemAsset: decodeURIComponent(button.dataset.asset), item: decodeURIComponent(button.dataset.item), rarity: decodeURIComponent(button.dataset.rarity || "") });
+        button.classList.toggle("active", active);
+        button.textContent = active ? "*" : "+";
+        button.title = active ? "Remove favorite" : "Add favorite";
+      });
+      updateItemModalFavoriteButton();
+    }
+
+    function updateItemModalFavoriteButton() {
+      const button = $("itemModalFavorite");
+      if (!button || !state.selectedItem) return;
+      const active = isFavoriteItem(state.selectedItem);
+      button.textContent = active ? "Remove Favorite" : "Favorite Item";
     }
 
     function fillSelect(id, values, allLabel = "All") {
@@ -1625,6 +2269,45 @@ INDEX_HTML = r"""<!doctype html>
       $(tbodyId).innerHTML = `<tr><td colspan="${colspan}" class="muted">${escapeHtml(text)}</td></tr>`;
     }
 
+    function cssToken(value) {
+      return String(value || "none").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "none";
+    }
+
+    function pill(label, className = "", title = "") {
+      const clean = escapeHtml(label || "Unknown");
+      const cleanTitle = escapeAttr(title || label || "Unknown");
+      return `<span class="pill ${className}" title="${cleanTitle}">${clean}</span>`;
+    }
+
+    function rarityBadge(rarity) {
+      return pill(rarity, `rarity-${cssToken(rarity)}`);
+    }
+
+    function kindBadge(kind) {
+      return pill(kind, `kind-${cssToken(kind)}`);
+    }
+
+    function categoryBadge(category) {
+      return pill(category, `category-${cssToken(category)}`);
+    }
+
+    function diffBadges(values, summary) {
+      const list = Array.isArray(values) ? values : [];
+      if (!list.length || list.length > 4) {
+        return `<span title="${escapeAttr(list.join(', '))}">${escapeHtml(summary || "")}</span>`;
+      }
+      return list.map((value) => pill(value, `diff-${cssToken(value)}`)).join("");
+    }
+
+    function mapBadges(values, summary) {
+      const list = Array.isArray(values) ? values : [];
+      if (!list.length) return `<span class="muted">${escapeHtml(summary || "")}</span>`;
+      if (list.length > 4) {
+        return pill(`${list.length} maps`, "summary", list.join(", "));
+      }
+      return list.map((value) => pill(value, "summary")).join("");
+    }
+
     function statCards(stats) {
       const pairs = [
         ["Loot Tables", stats.loot_tables],
@@ -1652,6 +2335,12 @@ INDEX_HTML = r"""<!doctype html>
       return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
     }
 
+    function formatDate(seconds) {
+      const value = Number(seconds || 0);
+      if (!value) return "";
+      return new Date(value * 1000).toLocaleString();
+    }
+
     function cacheFileName(path) {
       return String(path || "loot_spawn_cache.pkl.gz").split(/[\\/]/).pop();
     }
@@ -1668,11 +2357,63 @@ INDEX_HTML = r"""<!doctype html>
         label.textContent = "Cache save failed";
         label.style.color = "var(--danger)";
       } else if (cache.exists) {
-        label.textContent = `${cacheFileName(cache.path)} saved (${formatBytes(cache.sizeBytes)})`;
+        const created = formatDate(cache.createdAt);
+        label.textContent = `${cacheFileName(cache.path)} saved (${formatBytes(cache.sizeBytes)})${created ? ` - ${created}` : ""}`;
       } else {
         label.textContent = "No cache saved yet";
       }
       label.title = cache.path || "";
+    }
+
+    function renderFavorites() {
+      const sourceRows = state.settings.favorites.sources;
+      if (!sourceRows.length) {
+        tableMessage("favoriteSourceRows", 4, "No favorite sources yet.");
+      } else {
+        $("favoriteSourceRows").innerHTML = sourceRows.map((row) => `
+          <tr>
+            <td><span class="primary-name">${escapeHtml(row.source)}</span></td>
+            <td>${kindBadge(row.kind)}</td>
+            <td><button class="small fav-open-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.kind)}">Open</button></td>
+            <td><button class="small fav-remove-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.kind)}">Remove</button></td>
+          </tr>
+        `).join("");
+        document.querySelectorAll(".fav-open-source").forEach((button) => {
+          button.addEventListener("click", () => openScenarioModal(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind)));
+        });
+        document.querySelectorAll(".fav-remove-source").forEach((button) => {
+          button.addEventListener("click", () => toggleFavoriteSource(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind)));
+        });
+      }
+
+      const itemRows = state.settings.favorites.items;
+      if (!itemRows.length) {
+        tableMessage("favoriteItemRows", 4, "No favorite items yet.");
+      } else {
+        $("favoriteItemRows").innerHTML = itemRows.map((row) => `
+          <tr>
+            <td><span class="primary-name">${escapeHtml(row.item)}</span></td>
+            <td>${rarityBadge(row.rarity || "Unknown")}</td>
+            <td><button class="small fav-open-item" data-asset="${encodeURIComponent(row.itemAsset || "")}" data-item="${encodeURIComponent(row.item)}" data-rarity="${encodeURIComponent(row.rarity || "")}" data-category="${encodeURIComponent(row.category || "")}">Open</button></td>
+            <td><button class="small fav-remove-item" data-asset="${encodeURIComponent(row.itemAsset || "")}" data-item="${encodeURIComponent(row.item)}" data-rarity="${encodeURIComponent(row.rarity || "")}">Remove</button></td>
+          </tr>
+        `).join("");
+        document.querySelectorAll(".fav-open-item").forEach((button) => {
+          button.addEventListener("click", () => openItemModal({
+            itemAsset: decodeURIComponent(button.dataset.asset),
+            item: decodeURIComponent(button.dataset.item),
+            rarity: decodeURIComponent(button.dataset.rarity || ""),
+            category: decodeURIComponent(button.dataset.category || ""),
+          }));
+        });
+        document.querySelectorAll(".fav-remove-item").forEach((button) => {
+          button.addEventListener("click", () => toggleFavoriteItem({
+            itemAsset: decodeURIComponent(button.dataset.asset),
+            item: decodeURIComponent(button.dataset.item),
+            rarity: decodeURIComponent(button.dataset.rarity || ""),
+          }));
+        });
+      }
     }
 
     async function loadStatus(refreshData = true) {
@@ -1680,10 +2421,16 @@ INDEX_HTML = r"""<!doctype html>
       state.lastStatus = data;
       state.ready = data.ready;
       state.filters = data.filters;
+      if (!state.settingsLoaded) {
+        state.settings = normalizeSettings(data.settings || {});
+        state.settingsLoaded = true;
+        renderFavorites();
+      }
       $("rootInput").value = data.root;
       $("luckInput").value = data.luck;
       $("notReady").style.display = data.ready ? "none" : "block";
       $("scanButton").disabled = data.scanning || data.recalculating;
+      $("scanSaveButton").disabled = data.scanning || data.recalculating || (data.cache && data.cache.saving);
       $("luckButton").disabled = data.scanning || data.recalculating || !data.ready;
       updateCacheStatus(data.cache || {});
       if (data.scanning) {
@@ -1700,6 +2447,11 @@ INDEX_HTML = r"""<!doctype html>
       }
       $("stats").innerHTML = statCards(data.stats || {});
       $("warnings").textContent = data.error || (data.warnings && data.warnings.length ? data.warnings.join("\n") : "No warnings.");
+      const loadedAt = formatDate(data.data && data.data.loadedAt);
+      const cacheAt = formatDate(data.data && data.data.cacheCreatedAt);
+      $("dataLabel").textContent = data.ready
+        ? `v${data.version} - data ${loadedAt || "loaded"}${cacheAt ? ` - cache ${cacheAt}` : ""}`
+        : `v${data.version}`;
       fillSelect("sourceMap", data.filters.maps || []);
       fillSelect("itemMap", data.filters.maps || []);
       fillSelect("sourceDiff", data.filters.diffs || []);
@@ -1708,6 +2460,11 @@ INDEX_HTML = r"""<!doctype html>
       fillSelect("sourceRarity", data.filters.rarities || []);
       fillSelect("itemRarity", data.filters.rarities || []);
       fillSelect("detailRarity", data.filters.rarities || []);
+      if (!state.uiRestored && state.settings.ui.activeTab && $(state.settings.ui.activeTab)) {
+        state.uiRestored = true;
+        activateTab(state.settings.ui.activeTab);
+        return;
+      }
       if (data.ready) {
         if (refreshData) {
           if (state.activeTab === "items") {
@@ -1757,17 +2514,18 @@ INDEX_HTML = r"""<!doctype html>
         $("sourceCount").textContent = rangeLabel(data.total, data.offset, data.rows.length, "sources");
         setPager("source", data.offset, data.rows.length, data.total);
         if (!data.rows.length) {
-          tableMessage("sourceRows", 7, "No mob/chest sources match the current filters.");
+          tableMessage("sourceRows", 8, "No mob/chest sources match the current filters.");
           return;
         }
         $("sourceRows").innerHTML = data.rows.map((row) => `
           <tr class="clickable" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}">
-            <td title="${escapeAttr(row.source)}">${escapeHtml(row.source)}</td>
-            <td>${escapeHtml(row.sourceKind)}</td>
+            <td><button class="favorite" data-fav-type="source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}" title="Add favorite">+</button></td>
+            <td title="${escapeAttr(row.source)}"><span class="primary-name">${escapeHtml(row.source)}</span></td>
+            <td>${kindBadge(row.sourceKind)}</td>
             <td class="num">${number(row.itemCount)}</td>
             <td class="num">${number(row.scenarioCount)}</td>
-            <td>${escapeHtml(row.maps)}</td>
-            <td>${escapeHtml(row.diffs)}</td>
+            <td>${mapBadges(row.mapValues, row.maps)}</td>
+            <td>${diffBadges(row.diffValues, row.diffs)}</td>
             <td><button class="open-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}">Open</button></td>
           </tr>
         `).join("");
@@ -1780,12 +2538,19 @@ INDEX_HTML = r"""<!doctype html>
             openScenarioModal(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind));
           });
         });
+        [...$("sourceRows").querySelectorAll("button.favorite")].forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            toggleFavoriteSource(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind));
+          });
+        });
+        refreshFavoriteButtons();
       } catch (error) {
         if (requestId !== state.sourceRequest) return;
         $("sourceRows").classList.remove("loading");
         $("sourceCount").textContent = "Could not load sources";
         setPager("source", 0, 0, 0);
-        tableMessage("sourceRows", 7, error.message);
+        tableMessage("sourceRows", 8, error.message);
       }
     }
 
@@ -1817,46 +2582,143 @@ INDEX_HTML = r"""<!doctype html>
         $("itemCount").textContent = rangeLabel(data.total, data.offset, data.rows.length, itemLabel);
         setPager("item", data.offset, data.rows.length, data.total);
         if (!data.rows.length) {
-          tableMessage("itemRows", 6, "No items match the current filters.");
+          tableMessage("itemRows", 7, "No items match the current filters.");
           return;
         }
         $("itemRows").innerHTML = data.rows.map((row) => `
-          <tr data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}" data-item="${encodeURIComponent(row.item)}">
-            <td>${escapeHtml(row.item)}</td>
-            <td>${escapeHtml(row.rarity)}</td>
-            <td>${escapeHtml(row.category)}</td>
-            <td title="${escapeAttr(row.maps.join(', '))}">${escapeHtml(row.map)}</td>
-            <td title="${escapeAttr(row.diffs.join(', '))}">${escapeHtml(row.diff)}</td>
-            <td><button class="open-item-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}" data-item="${encodeURIComponent(row.item)}" data-source-count="${row.sourceCount}">${row.sourceCount > 1 ? "Sources" : "Open"}</button></td>
+          <tr data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}" data-item="${encodeURIComponent(row.item)}" data-asset="${encodeURIComponent(row.itemAsset)}">
+            <td><button class="favorite" data-fav-type="item" data-asset="${encodeURIComponent(row.itemAsset)}" data-item="${encodeURIComponent(row.item)}" data-rarity="${encodeURIComponent(row.rarity)}" data-category="${encodeURIComponent(row.category)}" title="Add favorite">+</button></td>
+            <td><span class="primary-name">${escapeHtml(row.item)}</span></td>
+            <td>${rarityBadge(row.rarity)}</td>
+            <td>${categoryBadge(row.category)}</td>
+            <td title="${escapeAttr(row.maps.join(', '))}">${mapBadges(row.maps, row.map)}</td>
+            <td title="${escapeAttr(row.diffs.join(', '))}">${diffBadges(row.diffs, row.diff)}</td>
+            <td><button class="open-item-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}" data-item="${encodeURIComponent(row.item)}" data-asset="${encodeURIComponent(row.itemAsset)}" data-rarity="${encodeURIComponent(row.rarity)}" data-category="${encodeURIComponent(row.category)}">Sources</button></td>
           </tr>
         `).join("");
         [...$("itemRows").querySelectorAll("button.open-item-source")].forEach((button) => {
           button.addEventListener("click", () => {
-            const itemName = decodeURIComponent(button.dataset.item);
-            if (Number(button.dataset.sourceCount || 0) > 1) {
-              activateTab("sources");
-              $("sourceSearch").value = "";
-              $("sourceItem").value = itemName;
-              $("sourceMap").value = $("itemMap").value || "All";
-              $("sourceDiff").value = $("itemDiff").value || "All";
-              $("sourceRarity").value = $("itemRarity").value || "All";
-              state.sourceOffset = 0;
-              loadSources();
-              return;
-            }
-            openScenarioModal(decodeURIComponent(button.dataset.source), decodeURIComponent(button.dataset.kind), itemName);
+            openItemModal({
+              item: decodeURIComponent(button.dataset.item),
+              itemAsset: decodeURIComponent(button.dataset.asset),
+              rarity: decodeURIComponent(button.dataset.rarity),
+              category: decodeURIComponent(button.dataset.category),
+            });
           });
         });
+        [...$("itemRows").querySelectorAll("button.favorite")].forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            toggleFavoriteItem({
+              item: decodeURIComponent(button.dataset.item),
+              itemAsset: decodeURIComponent(button.dataset.asset),
+              rarity: decodeURIComponent(button.dataset.rarity || ""),
+              category: decodeURIComponent(button.dataset.category || ""),
+            });
+          });
+        });
+        refreshFavoriteButtons();
       } catch (error) {
         if (requestId !== state.itemRequest) return;
         $("itemRows").classList.remove("loading");
         $("itemCount").textContent = "Could not load items";
         setPager("item", 0, 0, 0);
-        tableMessage("itemRows", 6, error.message);
+        tableMessage("itemRows", 7, error.message);
       }
     }
 
-    async function openScenarioModal(source, kind, itemFilter = "") {
+    function itemSourceQuery() {
+      const params = new URLSearchParams();
+      const item = state.selectedItem || {};
+      params.set("asset", item.itemAsset || "");
+      params.set("item", item.item || "");
+      params.set("source", $("itemModalSource").value || "");
+      params.set("map", $("itemModalMap").value || "All");
+      params.set("diff", $("itemModalDiff").value || "All");
+      params.set("rarity", item.rarity || "All");
+      params.set("limit", $("itemModalLimit").value || "100");
+      params.set("offset", state.itemSourceOffset);
+      params.set("sort", state.itemSourceSort.key);
+      params.set("dir", state.itemSourceSort.dir);
+      return params;
+    }
+
+    async function openItemModal(item) {
+      state.selectedItem = item;
+      state.itemSourceOffset = 0;
+      $("itemModalTitle").textContent = item.item || "Item Details";
+      $("itemModalSummary").innerHTML = [
+        rarityBadge(item.rarity || "Unknown"),
+        categoryBadge(item.category || "Unknown"),
+        item.itemAsset ? pill(item.itemAsset, "", item.itemAsset) : "",
+      ].filter(Boolean).join("");
+      $("itemModalSource").value = $("itemSource").value || "";
+      fillSelect("itemModalMap", state.filters.maps || []);
+      fillSelect("itemModalDiff", state.filters.diffs || []);
+      $("itemModalMap").value = $("itemMap").value || "All";
+      $("itemModalDiff").value = $("itemDiff").value || "All";
+      $("itemModal").classList.add("active");
+      refreshFavoriteButtons();
+      await loadItemSources();
+    }
+
+    async function loadItemSources() {
+      if (!state.ready || !state.selectedItem) return;
+      const requestId = ++state.itemSourceRequest;
+      $("itemModalCount").textContent = "Loading sources...";
+      $("itemModalRows").classList.add("loading");
+      try {
+        const data = await api(`/api/item-sources?${itemSourceQuery().toString()}`);
+        if (requestId !== state.itemSourceRequest) return;
+        $("itemModalRows").classList.remove("loading");
+        if (data.item) {
+          $("itemModalSummary").innerHTML = [
+            rarityBadge(data.item.rarity || "Unknown"),
+            categoryBadge(data.item.category || "Unknown"),
+            pill(`${number(data.item.rowCount)} matching rows`, "summary"),
+            mapBadges(data.item.maps, ""),
+            diffBadges(data.item.diffs, ""),
+          ].filter(Boolean).join("");
+        }
+        $("itemModalCount").textContent = rangeLabel(data.total, data.offset, data.rows.length, "sources");
+        setPager("itemModal", data.offset, data.rows.length, data.total);
+        if (!data.rows.length) {
+          tableMessage("itemModalRows", 7, "No sources match this item and filter.");
+          return;
+        }
+        $("itemModalRows").innerHTML = data.rows.map((row) => `
+          <tr>
+            <td><span class="primary-name">${escapeHtml(row.source)}</span></td>
+            <td>${kindBadge(row.sourceKind)}</td>
+            <td>${mapBadges(row.mapValues, row.maps)}</td>
+            <td>${diffBadges(row.diffValues, row.diffs)}</td>
+            <td class="num">${number(row.scenarioCount)}</td>
+            <td class="num">${row.chance}</td>
+            <td><button class="small open-item-picked-source" data-source="${encodeURIComponent(row.source)}" data-kind="${encodeURIComponent(row.sourceKind)}">Open</button></td>
+          </tr>
+        `).join("");
+        document.querySelectorAll(".open-item-picked-source").forEach((button) => {
+          button.addEventListener("click", () => {
+            $("itemModal").classList.remove("active");
+            openScenarioModal(
+              decodeURIComponent(button.dataset.source),
+              decodeURIComponent(button.dataset.kind),
+              state.selectedItem.item || "",
+              $("itemModalMap").value || "All",
+              $("itemModalDiff").value || "All",
+            );
+          });
+        });
+      } catch (error) {
+        if (requestId !== state.itemSourceRequest) return;
+        $("itemModalRows").classList.remove("loading");
+        $("itemModalCount").textContent = "Could not load item sources";
+        setPager("itemModal", 0, 0, 0);
+        tableMessage("itemModalRows", 7, error.message);
+      }
+    }
+
+    async function openScenarioModal(source, kind, itemFilter = "", preferredMap = "All", preferredDiff = "All") {
       state.selectedSource = { source, kind };
       $("modalTitle").textContent = source;
       const selectedItemFilter = itemFilter || $("sourceItem").value;
@@ -1866,10 +2728,22 @@ INDEX_HTML = r"""<!doctype html>
       $("scenarioModal").classList.add("active");
       $("modalOpen").disabled = true;
       $("modalCount").textContent = "Loading scenario choices...";
+      $("modalPresets").innerHTML = "";
       try {
         const data = await api(`/api/source-options?${params.toString()}`);
         fillModalSelect("modalMap", data.maps);
         fillModalSelect("modalDiff", data.diffs);
+        if ([...$("modalMap").options].some((option) => option.value === preferredMap)) $("modalMap").value = preferredMap;
+        if ([...$("modalDiff").options].some((option) => option.value === preferredDiff)) $("modalDiff").value = preferredDiff;
+        $("modalPresets").innerHTML = (data.scenarios || []).slice(0, 16).map((scenario) => (
+          `<button type="button" data-map="${escapeAttr(scenario.map)}" data-diff="${escapeAttr(scenario.diff)}">${escapeHtml(scenario.diff)} ${escapeHtml(scenario.map)}</button>`
+        )).join("");
+        [...$("modalPresets").querySelectorAll("button")].forEach((button) => {
+          button.addEventListener("click", () => {
+            $("modalMap").value = button.dataset.map;
+            $("modalDiff").value = button.dataset.diff;
+          });
+        });
         $("modalCount").textContent = `${number(data.total)} matching rows before scenario filters`;
         $("modalOpen").disabled = !data.total;
       } catch (error) {
@@ -1916,6 +2790,7 @@ INDEX_HTML = r"""<!doctype html>
       params.set("diff", scenario.diff);
       params.set("item", $("detailSearch").value || scenario.item || "");
       params.set("rarity", $("detailRarity").value || "All");
+      params.set("compareLuck", $("detailCompareLuck").value || "");
       params.set("limit", forCsv ? "5000" : ($("detailLimit").value || "500"));
       params.set("offset", forCsv ? "0" : state.detailOffset);
       params.set("sort", state.detailSort.key);
@@ -1923,9 +2798,21 @@ INDEX_HTML = r"""<!doctype html>
       return params;
     }
 
+    function detailColumnCount() {
+      return $("detailCompareLuck").value ? 13 : 11;
+    }
+
+    function updateCompareColumns() {
+      const compareLuck = $("detailCompareLuck").value;
+      const show = Boolean(compareLuck);
+      document.querySelectorAll(".compare-col").forEach((node) => node.classList.toggle("hidden", !show));
+      $("compareHead").textContent = compareLuck ? `Chance @ ${compareLuck}` : "Compare";
+    }
+
     async function loadDetail() {
       if (!state.selectedScenario) return;
       const requestId = ++state.detailRequest;
+      updateCompareColumns();
       $("detailMeta").textContent = "Loading drops...";
       $("detailRows").classList.add("loading");
       try {
@@ -1937,22 +2824,27 @@ INDEX_HTML = r"""<!doctype html>
         $("detailMeta").textContent = `${sc.map} / ${sc.diff} - ${rangeLabel(data.total, data.offset, data.rows.length, "drops")}`;
         setPager("detail", data.offset, data.rows.length, data.total);
         if (!data.rows.length) {
-          tableMessage("detailRows", 11, "No drops match this scenario.");
+          tableMessage("detailRows", detailColumnCount(), "No drops match this scenario.");
           return;
         }
         $("detailRows").innerHTML = data.rows.map((row) => {
           const scenario = `${row.mapCode} ${row.map} | ${row.diff} | ${row.group}`;
+          const compareCells = $("detailCompareLuck").value ? `
+              <td class="num compare-col">${row.compareAtLeastOne || ""}</td>
+              <td class="num compare-col ${Number(row.compareDeltaValue || 0) >= 0 ? "delta-pos" : "delta-neg"}">${row.compareDelta || ""}</td>
+            ` : "";
           return `
             <tr>
               <td>${escapeHtml(scenario)}</td>
-              <td>${escapeHtml(row.item)}</td>
-              <td>${escapeHtml(row.rarity)}</td>
-              <td>${escapeHtml(row.category)}</td>
-              <td class="num">G${row.grade}</td>
+              <td><span class="primary-name">${escapeHtml(row.item)}</span></td>
+              <td>${rarityBadge(row.rarity)}</td>
+              <td>${categoryBadge(row.category)}</td>
+              <td class="num">${pill(`G${row.grade}`)}</td>
               <td class="num">${row.itemCount}</td>
               <td class="num">${row.rolls}</td>
               <td class="num">${row.baseAtLeastOne}</td>
               <td class="num">${row.dynAtLeastOne}</td>
+              ${compareCells}
               <td>${escapeHtml(row.lootTable)}</td>
               <td>${escapeHtml(row.rateTable)}</td>
             </tr>
@@ -1963,7 +2855,7 @@ INDEX_HTML = r"""<!doctype html>
         $("detailRows").classList.remove("loading");
         $("detailMeta").textContent = "Could not load drops";
         setPager("detail", 0, 0, 0);
-        tableMessage("detailRows", 11, error.message);
+        tableMessage("detailRows", detailColumnCount(), error.message);
       }
     }
 
@@ -2046,6 +2938,43 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function waitForScanComplete() {
+      for (;;) {
+        const data = await api("/api/status");
+        state.lastStatus = data;
+        if (data.scanning) {
+          setStatus(`Scanning... ${Math.round(data.elapsed || 0)}s`);
+          await sleep(1200);
+          continue;
+        }
+        await loadStatus(true);
+        if (data.error) throw new Error("Scan failed. See Scan Info.");
+        return data;
+      }
+    }
+
+    async function scanAndSaveCache() {
+      try {
+        state.sourceOffset = 0;
+        state.itemOffset = 0;
+        state.detailOffset = 0;
+        setStatus("Starting scan and cache refresh...");
+        await api("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ root: $("rootInput").value, luck: Number($("luckInput").value || 0) }),
+        });
+        await waitForScanComplete();
+        await saveCache();
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
     async function applyLuck() {
       if (!state.ready) return;
       try {
@@ -2082,6 +3011,9 @@ INDEX_HTML = r"""<!doctype html>
       state.activeTab = name;
       document.querySelectorAll(".tab").forEach((button) => button.classList.toggle("active", button.dataset.tab === name));
       document.querySelectorAll("main > section").forEach((section) => section.classList.toggle("active", section.id === name));
+      state.settings.ui.activeTab = name;
+      if (state.settingsLoaded) saveSettings();
+      if (name === "favorites") renderFavorites();
       if (state.ready) {
         if (name === "sources") loadSources();
         if (name === "items") loadItems();
@@ -2116,12 +3048,17 @@ INDEX_HTML = r"""<!doctype html>
       });
     });
     $("scanButton").addEventListener("click", startScan);
+    $("scanSaveButton").addEventListener("click", scanAndSaveCache);
     $("luckButton").addEventListener("click", applyLuck);
     $("saveCacheButton").addEventListener("click", saveCache);
     $("refreshButton").addEventListener("click", () => loadStatus(true).catch((error) => setStatus(error.message, true)));
     ["sourceSearch", "sourceItem", "sourceMap", "sourceDiff", "sourceRarity", "sourceLimit"].forEach((id) => $(id).addEventListener("input", refreshSources));
     ["itemSearch", "itemSource", "itemMap", "itemDiff", "itemCategory", "itemRarity", "itemLimit"].forEach((id) => $(id).addEventListener("input", refreshItems));
-    ["detailSearch", "detailRarity", "detailLimit"].forEach((id) => $(id).addEventListener("input", refreshDetail));
+    ["detailSearch", "detailRarity", "detailLimit", "detailCompareLuck"].forEach((id) => $(id).addEventListener("input", refreshDetail));
+    ["itemModalSource", "itemModalMap", "itemModalDiff", "itemModalLimit"].forEach((id) => $(id).addEventListener("input", debounce(() => {
+      state.itemSourceOffset = 0;
+      loadItemSources();
+    })));
     $("sourcePrev").addEventListener("click", () => {
       state.sourceOffset = Math.max(0, state.sourceOffset - Number($("sourceLimit").value || 600));
       loadSources();
@@ -2146,6 +3083,14 @@ INDEX_HTML = r"""<!doctype html>
       state.detailOffset += Number($("detailLimit").value || 500);
       loadDetail();
     });
+    $("itemModalPrev").addEventListener("click", () => {
+      state.itemSourceOffset = Math.max(0, state.itemSourceOffset - Number($("itemModalLimit").value || 100));
+      loadItemSources();
+    });
+    $("itemModalNext").addEventListener("click", () => {
+      state.itemSourceOffset += Number($("itemModalLimit").value || 100);
+      loadItemSources();
+    });
     $("clearSourceFilters").addEventListener("click", () => {
       ["sourceSearch", "sourceItem"].forEach((id) => $(id).value = "");
       ["sourceMap", "sourceDiff", "sourceRarity"].forEach((id) => $(id).value = "All");
@@ -2160,6 +3105,17 @@ INDEX_HTML = r"""<!doctype html>
     });
     $("modalCancel").addEventListener("click", () => $("scenarioModal").classList.remove("active"));
     $("modalOpen").addEventListener("click", openDetail);
+    $("itemModalClose").addEventListener("click", () => $("itemModal").classList.remove("active"));
+    $("itemModalFavorite").addEventListener("click", () => {
+      if (state.selectedItem) toggleFavoriteItem(state.selectedItem);
+    });
+    $("clearFavorites").addEventListener("click", () => {
+      state.settings.favorites.sources = [];
+      state.settings.favorites.items = [];
+      renderFavorites();
+      refreshFavoriteButtons();
+      saveSettings();
+    });
     $("closeDetail").addEventListener("click", () => $("sourceDetail").classList.remove("active"));
     $("exportDetail").addEventListener("click", () => {
       if (!state.selectedScenario) return;
@@ -2170,7 +3126,10 @@ INDEX_HTML = r"""<!doctype html>
       window.location.href = `/api/export/items.csv?${itemQuery(true).toString()}`;
     });
     window.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") $("scenarioModal").classList.remove("active");
+      if (event.key === "Escape") {
+        $("scenarioModal").classList.remove("active");
+        $("itemModal").classList.remove("active");
+      }
     });
 
     updateSortHeaders();
@@ -2203,6 +3162,10 @@ class LootWebHandler(BaseHTTPRequestHandler):
                 self.handle_source_options(params)
             elif parsed.path == "/api/source-drops":
                 self.handle_source_drops(params)
+            elif parsed.path == "/api/item-sources":
+                self.handle_item_sources(params)
+            elif parsed.path == "/api/settings":
+                self.send_json(self.state.settings)
             elif parsed.path == "/api/export/source-drops.csv":
                 index, result, luck = self.state.current_data()
                 rows = sort_detail_rows(detail_summary(rows_with_luck(filter_exact_source_rows(index, params), result, luck)), param(params, "sort", "dyn"), param(params, "dir", "desc") != "asc") if index else []
@@ -2221,11 +3184,15 @@ class LootWebHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
-            if parsed.path not in ("/api/scan", "/api/luck", "/api/cache/save"):
+            if parsed.path not in ("/api/scan", "/api/luck", "/api/cache/save", "/api/settings"):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             length = int(self.headers.get("Content-Length", "0") or 0)
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            if parsed.path == "/api/settings":
+                saved = self.state.save_settings(payload)
+                self.send_json({"saved": saved, "settings": self.state.settings})
+                return
             if parsed.path == "/api/scan":
                 root = Path(payload.get("root") or self.state.root)
                 luck = int(payload.get("luck", self.state.luck) or 0)
@@ -2265,17 +3232,50 @@ class LootWebHandler(BaseHTTPRequestHandler):
         rows = filter_exact_source_rows(index, params) if index else []
         maps = visible_map_values({map_name for row in rows for map_name in row["maps"]})
         diffs = visible_diff_values({diff for row in rows for diff in row["diffs"]})
-        self.send_json({"total": len(rows), "maps": maps, "diffs": diffs})
+        self.send_json({"total": len(rows), "maps": maps, "diffs": diffs, "scenarios": source_pair_summary(rows)})
 
     def handle_source_drops(self, params: dict[str, list[str]]) -> None:
         index, result, luck = self.state.current_data()
         if not index:
             self.send_json({"total": 0, "offset": 0, "limit": DEFAULT_LIMIT, "rows": []})
             return
-        rows = detail_summary(rows_with_luck(filter_exact_source_rows(index, params), result, luck))
+        base_rows = filter_exact_source_rows(index, params)
+        rows = detail_summary(rows_with_luck(base_rows, result, luck))
+        compare_luck = None
+        compare_param = param(params, "compareLuck")
+        if compare_param.strip():
+            try:
+                compare_luck = int(compare_param)
+            except ValueError:
+                compare_luck = None
+        rows = attach_compare_luck(rows, base_rows, result, compare_luck)
         rows = sort_detail_rows(rows, param(params, "sort", "dyn"), param(params, "dir", "desc") != "asc")
         selected, total, offset, limit = page(rows, params)
         self.send_json({"total": total, "offset": offset, "limit": limit, "rows": [compact_row(row) for row in selected]})
+
+    def handle_item_sources(self, params: dict[str, list[str]]) -> None:
+        index, result, luck = self.state.current_data()
+        if not index:
+            self.send_json({"total": 0, "offset": 0, "limit": DEFAULT_LIMIT, "rows": [], "item": None})
+            return
+        base_rows = filter_item_source_rows(index, params)
+        rows = rows_with_luck(base_rows, result, luck)
+        summaries = item_source_summary(rows)
+        summaries = sort_item_source_rows(summaries, param(params, "sort", "chance"), param(params, "dir", "desc") != "asc")
+        selected, total, offset, limit = page(summaries, params)
+        item_info = None
+        if rows:
+            first = rows[0]
+            item_info = {
+                "item": first["item"],
+                "itemAsset": first["item_asset"],
+                "rarity": first["rarity"],
+                "category": first["cat"],
+                "maps": visible_map_values({map_name for row in rows for map_name in row["maps"]}),
+                "diffs": visible_diff_values({diff for row in rows for diff in row["diffs"]}),
+                "rowCount": len(rows),
+            }
+        self.send_json({"total": total, "offset": offset, "limit": limit, "item": item_info, "rows": selected})
 
     def send_json(self, value: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
@@ -2330,12 +3330,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_FILE, help="Saved scan cache file")
+    parser.add_argument("--settings", type=Path, default=DEFAULT_SETTINGS_FILE, help="Portable UI settings file")
     parser.add_argument("--no-cache-load", action="store_true", help="Do not load the saved scan cache on startup")
     parser.add_argument("--auto-scan", action="store_true", help="Start scanning as soon as the server launches")
     parser.add_argument("--open", action="store_true", help="Open the browser automatically")
     args = parser.parse_args(argv)
 
-    state = AppState(Path(args.root).resolve(), args.luck, args.cache)
+    state = AppState(Path(args.root).resolve(), args.luck, args.cache, args.settings)
     loaded_cache = False
     if not args.no_cache_load:
         loaded_cache = state.load_cache(args.cache)
