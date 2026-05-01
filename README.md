@@ -22,7 +22,7 @@ Content/DungeonCrawler/Data/Generated/V2
 ```
 You can also paste a different export root into the Export root box and press Scan.
 
-##Quick Start:
+## Quick Start:
 
 1) Run build_exe.bat.
 2)Open the browser page it prints or opens automatically:
