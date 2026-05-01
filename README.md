@@ -1,41 +1,29 @@
 # DungeonCrawler Loot Browser
+A local browser app for exploring loot tables from generated Dark And Darker export files.
 
-Local loot search app for generated DungeonCrawler export files.
+The app scans generated JSON exports, links loot groups, drop-rate tables, mobs, chests, props, items, maps, difficulties, rarities, and luck scaling into one searchable interface. It runs on your own machine at http://127.0.0.1:8765/ and does not require a public server.
 
-## Quick Start
+## Features
+- Search mobs, chests, props, and loot sources.
+- Search items across all sources, maps, and difficulties.
+- Open an item to see every source that can drop it.
+- Double-click or open a source, then choose the map and difficulty before viewing drops.
+- Search inside a source's drop list.
+- Group duplicate item results so common items do not flood the table.
+- Sort tables by clicking column headers.
+- Apply luck instantly to the current view without rescanning files.
+- Compare a drop table against another luck value.
+- Favorite sources and items.
+- Save a scan cache so future launches do not need to rescan the generated files.
+- Export item results and source drops to CSV.
 
-1. Double-click `run_loot_spawn_web.bat`.
-2. Open the browser page it prints or opens automatically: `http://127.0.0.1:8765/`.
-3. Wait for the scan to finish, then search from `Mob/Chest Search` or `Item Search`.
-
-The app auto-detects exports shaped like:
-
-```text
+```
 Content/DungeonCrawler/Data/Generated/V2
 ```
+You can also paste a different export root into the Export root box and press Scan.
 
-You can also paste a different export root into the `Export root` box and press `Scan`.
+##Quick Start:
 
-## Main Features
-
-- Search mobs, chests, props, and spawners by readable names.
-- Hide raw `Spawner` fallback sources so results focus on real monsters, props, and loot sources.
-- Double-click a source to choose map and difficulty before opening its drops.
-- Search items across all sources, maps, and difficulties.
-- Save the scanned data with `Save Scan Cache`, then reopen the app later without rescanning.
-- Export current item results or source drops to CSV.
-
-## Requirements
-
-- Windows
-- Python 3.10 or newer
-
-The browser app uses Python's standard library. The older Tkinter desktop analyzer is still present in `loot_spawn_analyzer.py`, but the recommended distributable app is `run_loot_spawn_web.bat`.
-
-## Notes
-
-- The first scan can take around 30-60 seconds on a large export.
-- Luck changes reuse the loaded scan and update only the current view.
-- If a new scan fails because the folder is wrong, the browser keeps the last successful results loaded.
-- The app auto-loads `loot_spawn_cache.pkl.gz` on startup when it exists beside `loot_spawn_web.py`.
-- Dungeon grade codes use the explicit game table: `100x = PVE`, `200x = Normal`, `300x = High Roller`, `400x = Squire`.
+1) Run build_exe.bat.
+2)Open the browser page it prints or opens automatically:
+```http://127.0.0.1:8765/```
