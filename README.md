@@ -24,7 +24,6 @@ You can also paste a different export root into the Export root box and press Sc
 
 ## Quick Start:
 
-1) Run build_exe.bat.
-
-2)Open the browser page it prints or opens automatically:
+1. Run build_exe.bat.
+2. Open the browser page it prints or opens automatically:
 ```http://127.0.0.1:8765/```
