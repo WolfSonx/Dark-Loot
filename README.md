@@ -1,4 +1,4 @@
-# DungeonCrawler Loot Browser
+# Dark Loot
 A local browser app for exploring loot tables from generated Dark And Darker export files.
 
 The app scans generated JSON exports, links loot groups, drop-rate tables, mobs, chests, props, items, maps, difficulties, rarities, and luck scaling into one searchable interface. It runs on your own machine at http://127.0.0.1:8765/ and does not require a public server.
