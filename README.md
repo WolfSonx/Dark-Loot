@@ -4,10 +4,9 @@ Local loot search app for generated DungeonCrawler export files.
 
 ## Quick Start
 
-1. Keep the exported `Content` folder beside these files.
-2. Double-click `run_loot_spawn_web.bat`.
-3. Open the browser page it prints or opens automatically: `http://127.0.0.1:8765/`.
-4. Wait for the scan to finish, then search from `Mob/Chest Search` or `Item Search`.
+1. Double-click `run_loot_spawn_web.bat`.
+2. Open the browser page it prints or opens automatically: `http://127.0.0.1:8765/`.
+3. Wait for the scan to finish, then search from `Mob/Chest Search` or `Item Search`.
 
 The app auto-detects exports shaped like:
 
